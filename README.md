@@ -4,6 +4,8 @@ A repeatable method — and the actual tools — for **reverse-engineering and r
 games**: crack the container, decode the assets and data, map the engine, recover the content, and
 rebuild the game in a modern, editable front-end.
 
+📺 **Video walkthrough (~6 min):** https://youtu.be/O4P510_5rqs
+
 ## Proven, end-to-end, on two very different games
 - **Midwinter (1989)** — decoded the **entire codebase**, 602 functions mapped and labeled, **including
   its 3D world** (the terrain generator was replicated and its output matches the original bit-for-bit).
