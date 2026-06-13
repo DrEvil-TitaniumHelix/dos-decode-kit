@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pool of Radiance — decode-kit reproduction</title>
+<style>
+  html,body{margin:0;background:#000;color:#cfc;font-family:"Courier New",monospace;}
+  #wrap{display:flex;flex-direction:column;align-items:center;padding:10px;}
+  #title{color:#fc4;letter-spacing:2px;font-weight:bold;margin:4px 0 8px;text-shadow:2px 2px #800;}
+  #game{display:grid;grid-template-columns:520px 300px;grid-gap:8px;}
+  canvas{image-rendering:pixelated;background:#000;border:3px solid #44a;}
+  #side{display:flex;flex-direction:column;gap:6px;}
+  .panel{border:2px solid #44a;padding:6px;background:#001;}
+  .ph{color:#fc4;border-bottom:1px solid #338;margin-bottom:4px;padding-bottom:2px;font-size:13px;}
+  .pc{display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px;}
+  .pc img{border:1px solid #225;background:#000;}
+  .pc .nm{color:#9cf;font-weight:bold;}
+  .pc .st{color:#8a8;font-size:11px;}
+  #log{grid-column:1/3;border:2px solid #44a;background:#001;padding:6px;min-height:46px;font-size:13px;color:#9c9;}
+  #help{color:#778;font-size:12px;margin-top:6px;}
+  .key{color:#fc4;}
+  #combat{display:flex;gap:2px;flex-wrap:wrap;}
+  #combat img{border:1px solid #113;background:#000;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="title">⚔  POOL OF RADIANCE — reconstructed from the decoded binary  ⚔</div>
+  <div id="game">
+    <div style="position:relative;width:512px;height:360px;">
+      <canvas id="view" width="512" height="360"></canvas>
+      <div id="dialog" style="display:none;position:absolute;left:14px;right:14px;bottom:14px;background:rgba(8,10,20,.93);border:2px solid #c9a24a;padding:12px 14px;font-family:'Courier New',monospace;">
+        <div style="color:#ffd246;font-size:10px;letter-spacing:1px;border-bottom:1px solid #5a4a22;padding-bottom:3px;margin-bottom:6px;">⌁ DECODED FROM THE ECL BYTECODE</div>
+        <div id="dialogtext" style="color:#e8e0c8;font-size:14px;line-height:1.35;"></div>
+      </div>
+    </div>
+    <div id="side">
+      <div class="panel"><div class="ph" id="maptitle">DUNGEON</div><div id="party"></div></div>
+      <div class="panel"><div class="ph">COMBAT SPRITES (CBODY.DAX)</div><div id="combat"></div></div>
+    </div>
+    <div id="log">You stand in the decoded dungeon. Every wall here is real data from GEO1.DAX.</div>
+  </div>
+  <div id="help"><span class="key">↑↓</span> move &nbsp; <span class="key">←/→</span> turn &nbsp; <span class="key">M</span> minimap &nbsp; <span class="key">&lt; &gt;</span> change level &nbsp; <span class="key">F</span> fight &nbsp; click a portrait for the character sheet</div>
+</div>
+<div id="sheet" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);align-items:center;justify-content:center;">
+  <div style="background:#001;border:3px solid #44a;padding:16px 22px;min-width:340px;font-size:14px;" id="sheetbody"></div>
+</div>
+<script src="game_data.js"></script>
+<script src="combat.js"></script>
+<script>
+const D=GAME_DATA, W=16, H=16;
+const cv=document.getElementById('view'), cx=cv.getContext('2d');
+cx.imageSmoothingEnabled=false;
+// decoded 8X8D masonry texture
+let wallPat=null;
+if(D.wallTex){ const wi=new Image(); wi.onload=()=>{ const c=document.createElement('canvas'); c.width=c.height=48; const g=c.getContext('2d'); g.imageSmoothingEnabled=false; g.drawImage(wi,0,0,48,48); wallPat=cx.createPattern(c,'repeat'); if(typeof render==='function') render(); }; wi.src=D.wallTex; }
+// ---- multiple decoded levels ----
+const LEVELS = D.levels && D.levels.length ? D.levels : [{name:D.mapName, walls:D.walls}];
+let lvl=0, curWalls=LEVELS[0].walls;
+// ---- wall queries from per-cell south(s)/east(e) nibbles ----
+function cell(x,y){ if(x<0||y<0||x>=W||y>=H) return null; return curWalls[y][x]; }
+function wallN(x,y){ const c=cell(x,y-1); return c? c.s>0 : true; }   // north edge = south wall of cell above
+function wallS(x,y){ const c=cell(x,y);   return c? c.s>0 : true; }
+function wallE(x,y){ const c=cell(x,y);   return c? c.e>0 : true; }
+function wallW(x,y){ const c=cell(x-1,y); return c? c.e>0 : true; }
+// dir 0=N,1=E,2=S,3=W. wall on a given absolute side of a cell:
+function wallSide(x,y,dir){ return [wallN,wallE,wallS,wallW][dir](x,y); }
+// movement deltas per dir
+const DX=[0,1,0,-1], DY=[-1,0,1,0];
+
+// player start: find a corridor cell (open ahead, walls flanking) for a dramatic view
+let px=1,py=1,pdir=1;
+function findStart(){
+  for(let y=2;y<H-2;y++)for(let x=2;x<W-2;x++){
+    for(let dir=0;dir<4;dir++){
+      const f=dir,l=(dir+3)%4,r=(dir+1)%4;
+      // open forward at least 2 cells, walls on both sides
+      if(!wallSide(x,y,f) && wallSide(x,y,l) && wallSide(x,y,r)){
+        const nx=x+DX[f],ny=y+DY[f];
+        if(cell(nx,ny) && !wallSide(nx,ny,f)){ px=x;py=y;pdir=dir; return; }
+      }
+    }
+  }
+  // fallback: any open cell
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){ const c=cell(x,y); if(c&&(c.s===0||c.e===0)){px=x;py=y;return;} }
+}
+findStart();
+
+// ---- first-person perspective renderer (Gold Box / Wizardry style) ----
+const VW=512, VH=360;
+const DEPTH=5;
+// half-extents of the tunnel opening at each depth plane (shrinking)
+function plane(d){
+  const t=Math.pow(0.56,d);
+  const hw=VW*0.5*t, hh=VH*0.46*t;
+  return {l:VW/2-hw, r:VW/2+hw, t:VH/2-hh, b:VH/2+hh};
+}
+function quad(p1,p2,p3,p4,fill,stroke){
+  cx.beginPath();cx.moveTo(p1[0],p1[1]);cx.lineTo(p2[0],p2[1]);
+  cx.lineTo(p3[0],p3[1]);cx.lineTo(p4[0],p4[1]);cx.closePath();
+  cx.fillStyle=fill;cx.fill(); if(stroke){cx.strokeStyle=stroke;cx.lineWidth=1;cx.stroke();}
+}
+function shade(base,d){ const f=Math.max(0.25,1-d*0.17); return `rgb(${(base[0]*f)|0},${(base[1]*f)|0},${(base[2]*f)|0})`; }
+// textured wall: decoded masonry pattern + depth-darkening overlay (fallback to solid)
+function texWall(pts,d,sideMul,base){
+  cx.beginPath(); cx.moveTo(pts[0][0],pts[0][1]);
+  for(let i=1;i<pts.length;i++) cx.lineTo(pts[i][0],pts[i][1]);
+  cx.closePath();
+  if(wallPat){ cx.fillStyle=wallPat; cx.fill();
+    const dk=Math.min(0.78, sideMul + d*0.16);            // depth + side darkening
+    cx.fillStyle=`rgba(0,0,0,${dk})`; cx.fill();
+  } else { cx.fillStyle=shade(base,d); cx.fill(); }
+  cx.strokeStyle='#223'; cx.lineWidth=1; cx.stroke();
+}
+const WALL=[80,90,150], SIDE=[55,62,110], FLOOR=[40,34,28], CEIL=[18,18,26];
+
+function render(){
+  cx.clearRect(0,0,VW,VH);
+  // ceiling + floor
+  cx.fillStyle=`rgb(${CEIL})`; cx.fillRect(0,0,VW,VH/2);
+  cx.fillStyle=`rgb(${FLOOR})`; cx.fillRect(0,VH/2,VW,VH/2);
+  const fwd=pdir, left=(pdir+3)%4, right=(pdir+1)%4;
+  // draw far -> near
+  for(let d=DEPTH-1; d>=0; d--){
+    const cxp=px+DX[fwd]*d, cyp=py+DY[fwd]*d;
+    if(cxp<0||cyp<0||cxp>=W||cyp>=H) continue;
+    const a=plane(d), b=plane(d+1);
+    // floor + ceiling trapezoids for this slab (subtle gradient via depth)
+    quad([a.l,a.b],[a.r,a.b],[b.r,b.b],[b.l,b.b], shade(FLOOR,d));
+    quad([a.l,a.t],[a.r,a.t],[b.r,b.t],[b.l,b.t], shade(CEIL,d));
+    // side walls (drawn as trapezoids from plane d to d+1)
+    if(wallSide(cxp,cyp,left))
+      texWall([[a.l,a.t],[b.l,b.t],[b.l,b.b],[a.l,a.b]], d, 0.30, SIDE);
+    if(wallSide(cxp,cyp,right))
+      texWall([[a.r,a.t],[b.r,b.t],[b.r,b.b],[a.r,a.b]], d, 0.30, SIDE);
+    // front wall: wall on the forward side of this cell -> blocks; draw filling plane d+1
+    if(wallSide(cxp,cyp,fwd)){
+      texWall([[b.l,b.t],[b.r,b.t],[b.r,b.b],[b.l,b.b]], d, 0.12, WALL);
+      break; // blocked; nothing beyond
+    }
+  }
+  drawMinimap();
+}
+// ---- minimap overlay ----
+let showMap=true;
+function drawMinimap(){
+  if(!showMap) return;
+  const s=4, ox=VW-W*s-6, oy=6;
+  cx.globalAlpha=0.85; cx.fillStyle='#000'; cx.fillRect(ox-2,oy-2,W*s+4,H*s+4);
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    const c=cell(x,y);
+    cx.fillStyle = (c && (c.s===0||c.e===0))? '#0a0a14':'#06060a';
+    cx.fillRect(ox+x*s,oy+y*s,s,s);
+    cx.strokeStyle='#3a3a6a'; cx.lineWidth=1;
+    if(c){ if(c.s>0){cx.beginPath();cx.moveTo(ox+x*s,oy+(y+1)*s);cx.lineTo(ox+(x+1)*s,oy+(y+1)*s);cx.stroke();}
+           if(c.e>0){cx.beginPath();cx.moveTo(ox+(x+1)*s,oy+y*s);cx.lineTo(ox+(x+1)*s,oy+(y+1)*s);cx.stroke();} }
+  }
+  // player
+  cx.fillStyle='#fc4'; cx.beginPath();
+  const mx=ox+px*s+s/2, my=oy+py*s+s/2;
+  cx.arc(mx,my,2.2,0,7);cx.fill();
+  cx.strokeStyle='#fc4';cx.beginPath();cx.moveTo(mx,my);cx.lineTo(mx+DX[pdir]*5,my+DY[pdir]*5);cx.stroke();
+  cx.globalAlpha=1;
+}
+function log(m){ document.getElementById('log').textContent=m; }
+let stepsSinceFight=0;
+function tryMove(sign){
+  const nd=pdir; const nx=px+DX[nd]*sign, ny=py+DY[nd]*sign;
+  // blocked if wall on the side we're crossing
+  const side = sign>0? pdir : (pdir+2)%4;
+  if(wallSide(px,py,side)){ log('A wall blocks your way.'); return; }
+  if(cell(nx,ny)===null){ log('The passage ends.'); return; }
+  hideDialog();
+  px=nx;py=ny;
+  log(`Party at (${px},${py}) facing ${['North','East','South','West'][pdir]}.`);
+  render();
+  // wandering encounter: small chance per step, with a grace period after a fight
+  stepsSinceFight++;
+  if(stepsSinceFight>4 && Math.random()<0.11){ stepsSinceFight=0;
+    const a=areaLines(); const line=a.length? a[Math.floor(Math.random()*a.length)]:'Something stirs in the dark ahead...';
+    showDialog(line); log('⚔ Wandering encounter!'); setTimeout(()=>{ if(mode==='explore'){ hideDialog(); startCombat(); } }, 2600); }
+}
+// ---- mode + combat ----
+let mode='explore', combat=null;
+function startCombat(){
+  mode='combat';
+  combat=new Combat(cx, D, (win,treasure)=>{
+    mode='explore'; combat=null;
+    log((win?'The party presses on, victorious.':'Defeated... (press F to try again)')+(treasure||''));
+    render();
+  });
+}
+cv.addEventListener('click',e=>{
+  if(mode!=='combat'||!combat) return;
+  const r=cv.getBoundingClientRect();
+  const sx=(e.clientX-r.left)*(cv.width/r.width), sy=(e.clientY-r.top)*(cv.height/r.height);
+  const ox=(cv.width-Combat.GW*Combat.CELL)/2, oy=8;
+  const gx=Math.floor((sx-ox)/Combat.CELL), gy=Math.floor((sy-oy)/Combat.CELL);
+  combat.click(gx,gy);
+});
+document.addEventListener('keydown',e=>{
+  if(mode==='combat'){
+    if(e.key===' '||e.key==='Spacebar'){ combat&&combat.pass(); e.preventDefault(); }
+    return;
+  }
+  if(e.key==='ArrowUp') tryMove(1);
+  else if(e.key==='ArrowDown') tryMove(-1);
+  else if(e.key==='ArrowLeft'){ pdir=(pdir+3)%4; render(); }
+  else if(e.key==='ArrowRight'){ pdir=(pdir+1)%4; render(); }
+  else if(e.key==='m'||e.key==='M'){ showMap=!showMap; render(); }
+  else if(e.key==='f'||e.key==='F'){ startCombat(); }
+  else if(e.key==='>'||e.key==='.'){ changeLevel(1); }
+  else if(e.key==='<'||e.key===','){ changeLevel(-1); }
+  else return;
+  e.preventDefault();
+});
+function areaLines(){ return (D.areaText && D.areaText[LEVELS[lvl].name]) || []; }
+function showDialog(t){ if(!t)return; document.getElementById('dialogtext').textContent=t; document.getElementById('dialog').style.display='block'; }
+function hideDialog(){ document.getElementById('dialog').style.display='none'; }
+function changeLevel(d){
+  lvl=(lvl+d+LEVELS.length)%LEVELS.length;
+  curWalls=LEVELS[lvl].walls;
+  findStart();
+  document.getElementById('maptitle').textContent=`PARTY — LEVEL ${lvl+1}/${LEVELS.length}: ${LEVELS[lvl].name}`;
+  const a=areaLines();
+  if(a.length){ showDialog(a[0]); log(`Entered ${LEVELS[lvl].name} — decoded area text shown.`); }
+  else { hideDialog(); log(`You enter ${LEVELS[lvl].name}.`); }
+  render();
+}
+// ---- side panels ----
+document.getElementById('maptitle').textContent = `PARTY — LEVEL 1/${LEVELS.length}: ${LEVELS[0].name}`;
+const pdiv=document.getElementById('party');
+D.party.forEach((c,i)=>{
+  const por=D.combat[i%D.combat.length];
+  const el=document.createElement('div'); el.className='pc'; el.style.cursor='pointer';
+  const strTxt = c.exstr>0 ? `${c.stats.STR}/${String(c.exstr).padStart(2,'0')}` : c.stats.STR;
+  el.innerHTML=`<img src="${por.url}" width="${por.w}" height="${por.h}">`+
+    `<div><div class="nm">${c.name} <span style="color:#c96">${c.cls}</span></div>`+
+    `<div class="st">STR ${strTxt} INT ${c.stats.INT} WIS ${c.stats.WIS}<br>DEX ${c.stats.DEX} CON ${c.stats.CON} CHA ${c.stats.CHA} &nbsp;HP ${c.hp}</div></div>`;
+  el.onclick=()=>showSheet(c,por);
+  pdiv.appendChild(el);
+});
+function showSheet(c,por){
+  const cc={Fighter:['Long Sword','Plate & Shield','AC 4'],Cleric:['Mace','Chain & Shield','AC 5'],
+            Thief:['Short Sword','Leather','AC 7'],'Magic-User':['Dagger','Robes','AC 9']}[c.cls]||['Weapon','Armor','AC 6'];
+  let thief='';
+  if(c.thief){ thief='<div style="color:#9c9;margin-top:8px">THIEF SKILLS<br>'+
+    Object.entries(c.thief).map(([k,v])=>`${k}: ${v}%`).join(' &nbsp; ')+'</div>'; }
+  document.getElementById('sheetbody').innerHTML=
+    `<div style="display:flex;gap:14px;align-items:flex-start">`+
+    `<img src="${por.url}" width="${por.w*1.6}" height="${por.h*1.6}" style="border:1px solid #225;background:#000">`+
+    `<div><div style="color:#fc4;font-size:18px;font-weight:bold">${c.name}</div>`+
+    `<div style="color:#c96;margin-bottom:6px">${c.cls} &nbsp;|&nbsp; HP ${c.hp} &nbsp;|&nbsp; ${cc[2]}</div>`+
+    `<div style="color:#9cf">STR ${c.exstr>0?c.stats.STR+'/'+String(c.exstr).padStart(2,'0'):c.stats.STR} &nbsp; INT ${c.stats.INT} &nbsp; WIS ${c.stats.WIS}<br>`+
+    `DEX ${c.stats.DEX} &nbsp; CON ${c.stats.CON} &nbsp; CHA ${c.stats.CHA}</div>`+
+    `<div style="color:#8a8;margin-top:6px">EQUIPPED (decoded from .ITM): ${(c.items&&c.items.length)?c.items.join(', '):cc[0]+', '+cc[1]}</div>${thief}</div></div>`+
+    `<div style="color:#778;font-size:11px;margin-top:12px">decoded from CHRDATA — name, abilities, exceptional STR, HP, thief skills all from the save record. <span style="color:#fc4;cursor:pointer" onclick="document.getElementById('sheet').style.display='none'">[ close ]</span></div>`;
+  document.getElementById('sheet').style.display='flex';
+}
+document.getElementById('sheet').onclick=e=>{ if(e.target.id==='sheet') document.getElementById('sheet').style.display='none'; };
+const comb=document.getElementById('combat');
+D.combat.slice(0,12).forEach(s=>{ const im=new Image(); im.src=s.url; im.width=s.w; im.height=s.h; comb.appendChild(im); });
+render();
+(function(){ const a=areaLines(); if(a.length){ showDialog(a[0]); log('Real area text decoded from the ECL bytecode. Move to dismiss.'); } })();
+if(location.search.indexOf('fight=1')>=0) startCombat();
+{ const ms=location.search.match(/sheet=(\d)/); if(ms){ const i=+ms[1]; showSheet(D.party[i],D.combat[i%D.combat.length]); } }
+// ---- deterministic autoplay demo (for capture) ----
+async function autoplay(){
+  const wait=ms=>new Promise(r=>setTimeout(r,ms));
+  stepsSinceFight=-999;                       // suppress random encounters during scripted demo
+  await wait(700);
+  for(let i=0;i<2;i++){ tryMove(1); await wait(620); }      // walk the textured corridor
+  // ── real decoded ECL dialog: Podol Plaza (hold for the read) ──
+  const a=areaLines();
+  if(a.length){ showDialog(a[0]); await wait(3800); hideDialog(); await wait(400); }
+  pdir=(pdir+1)%4; render(); await wait(700);
+  showSheet(D.party[5], D.combat[5]); await wait(2600);     // Phineas character sheet
+  document.getElementById('sheet').style.display='none'; await wait(400);
+  // ── encounter: real decoded line → combat ──
+  if(a.length>1){ showDialog(a[1]); await wait(2800); hideDialog(); }
+  startCombat(); await wait(1000);                          // tactical combat
+  let guard=0;
+  while(mode==='combat' && combat && !combat.over && guard++<120){
+    const u=combat.cur();
+    if(u && u.side==='pc') combat.autoAct();
+    await wait(720);
+  }
+  await wait(2000);                                         // show victory + loot
+  // ── travel to a DIFFERENT area, show its real decoded text ──
+  changeLevel(2); await wait(600);
+  const b=areaLines();
+  if(b.length){ showDialog(b[0]); await wait(3800); hideDialog(); }
+  for(let i=0;i<2;i++){ tryMove(1); await wait(620); }
+  await wait(1200);
+  window.__autoplayDone=true;
+}
+if(location.search.indexOf('autoplay=1')>=0) autoplay();
+</script>
+</body>
+</html>

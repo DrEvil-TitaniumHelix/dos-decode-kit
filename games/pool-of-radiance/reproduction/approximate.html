@@ -1,0 +1,576 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Pool of Radiance — approximate recreation</title>
+<style>
+  html,body{margin:0;background:#000;display:flex;flex-direction:column;align-items:center;font-family:monospace;}
+  /* canvas backing store IS the display resolution (320x200 at 3x) — no browser upscaling */
+  #scr{image-rendering:pixelated;width:960px;height:600px;margin-top:10px;background:#000;}
+  #cap{color:#778;font-size:12px;margin-top:6px;}
+  .key{color:#fc4;}
+</style></head>
+<body>
+<canvas id="scr" width="960" height="600"></canvas>
+<div id="cap"><span class="key">↑↓</span> move &nbsp;<span class="key">←→</span> turn &nbsp;<span class="key">&lt;&gt;</span> level &nbsp;<span class="key">F</span> fight &nbsp;— an <b>approximate</b> Gold Box recreation, all art decoded from the 1988 binary</div>
+<script src="game_data.js"></script>
+<script src="ui_art.js"></script>
+<script>
+const D=GAME_DATA, cx=document.getElementById('scr').getContext('2d');
+cx.scale(3,3);                      // all drawing stays in 320x200 coords
+cx.imageSmoothingEnabled=false;
+const EGA=D.ega.map(c=>`rgb(${c[0]},${c[1]},${c[2]})`);
+const LEVELS=D.levels&&D.levels.length?D.levels:[{name:D.mapName,walls:D.walls}];
+let lvl=0, curWalls=LEVELS[0].walls;
+const W=16,H=16, DX=[0,1,0,-1], DY=[-1,0,1,0];
+let px=1,py=1,pdir=1, msg="", phase='title';   // phase: title -> party -> game
+let active=0, searchMode=false, viewTab='items', itemSel=0;  // adventure-menu state
+// menu navigation stack — EXIT (E / Esc) pops one level, like the real game's circular menus
+let nav=['move'];
+function curMenu(){ return nav[nav.length-1]; }
+function push(m){ nav.push(m); draw(); }
+function back(){ if(nav.length>1){ nav.pop(); if(curMenu()==="move") look(); } draw(); }
+function cell(x,y){ if(x<0||y<0||x>=W||y>=H)return null; return curWalls[y][x]; }
+function wN(x,y){const c=cell(x,y);return c?c.n>0:true;} function wS(x,y){const c=cell(x,y);return c?c.s>0:true;}
+function wE(x,y){const c=cell(x,y);return c?c.e>0:true;} function wW(x,y){const c=cell(x,y);return c?c.w>0:true;}
+function wallSide(x,y,d){return [wN,wE,wS,wW][d](x,y);}
+// wall TYPE = the nibble value (decoded finite set): the wall's appearance, not just presence.
+function wallType(x,y,d){ const c=cell(x,y); if(!c) return 4; return [c.n,c.e,c.s,c.w][d]; }
+// type classes (from plane3 flag-ratio across all GEO levels): doors are flagged interactive.
+const DOOR_TYPES={5:1,10:1,11:1,13:1,15:1}, ARCH_TYPES={2:1,3:1,8:1};
+function findStart(){ for(let y=1;y<15;y++)for(let x=1;x<15;x++){for(let d=0;d<4;d++){const f=d,l=(d+3)%4,r=(d+1)%4;
+  if(!wallSide(x,y,f)&&wallSide(x,y,l)&&wallSide(x,y,r)){const nx=x+DX[f],ny=y+DY[f];if(cell(nx,ny)&&!wallSide(nx,ny,f)){px=x;py=y;pdir=d;return;}}}} }
+findStart();
+function areaLines(){ return (D.areaText&&D.areaText[LEVELS[lvl].name])||[]; }
+
+// ---- preload art ----
+const titleImg=new Image(); titleImg.src=D.titleScreen;
+const headImgs=(D.heads||[]).map(h=>{const i=new Image();i.src=h.url;return i;});
+let imgsReady=false; titleImg.onload=()=>{imgsReady=true; draw();};
+// real decoded textures (8X8D wall tiles): stone wall + cobblestone floor
+const wallImg=new Image(); wallImg.src=D.wallTile||D.wallTex; let wallPattern=null;
+wallImg.onload=()=>{ wallPattern=cx.createPattern(wallImg,'repeat'); draw(); };
+const floorImg=new Image(); floorImg.src=D.floorTile||D.floorTex||D.wallTex; let floorPattern=null;
+floorImg.onload=()=>{ floorPattern=cx.createPattern(floorImg,'repeat'); draw(); };
+const wallStripImg=new Image(); wallStripImg.src=D.wallStrip||D.wallTile||D.wallTex;
+// REAL decoded WALLDEF wall faces (byte-exact tile composition)
+const faceDoorImg=new Image(); if(D.wallFaceDoor) faceDoorImg.src=D.wallFaceDoor;
+const faceWinImg=new Image(); if(D.wallFaceWindow) faceWinImg.src=D.wallFaceWindow;
+const faceGateImg=new Image(); if(D.wallFaceGate) faceGateImg.src=D.wallFaceGate;
+const faceBaseImg=new Image(); if(D.wallFaceBase) faceBaseImg.src=D.wallFaceBase;
+// CRACKED type->face index: the 5 WALLDEF faces are ordered [base,window,gate,plain,door];
+// wall-type T (1-15): block=(T-1)//5 (WALLDEF 1/3/5), face=(T-1)%5. Verified vs plane3 flags.
+const FACE_ORDER=['base','window','gate','plain','door'];
+function faceCat(type){ return type>=1&&type<=15 ? FACE_ORDER[(type-1)%5] : 'plain'; }
+function faceImgFor(type){ return ({door:faceDoorImg,gate:faceGateImg,window:faceWinImg,base:faceBaseImg})[faceCat(type)]||null; }
+
+// ---- pixel text: THE REAL SSI FONT (decoded from 8X8D1.DAX block 201) ----
+function text(x,y,s,col){
+  cx.fillStyle=col; s=String(s).toUpperCase();
+  for(let ci=0;ci<s.length;ci++){
+    const o=s.charCodeAt(ci); const idx=(o>=0x40&&o<0x60)?o-0x40:o;
+    const rows=(idx>=0&&idx<64)?D.font64[idx]:D.font64[32];
+    for(let ry=0;ry<8;ry++){ const bits=rows[ry];
+      for(let rx=0;rx<8;rx++) if(bits&(0x80>>rx)) cx.fillRect(x+ci*8+rx,y+ry,1,1);
+    }
+  }
+}
+function ctext(cxp,y,s,col){ text(cxp-(String(s).length*8)/2,y,s,col); }
+// ---- woven rope border ----
+function buildTile(t){
+  const c=document.createElement('canvas'); c.width=t.w; c.height=t.h;
+  const g=c.getContext('2d'), id=g.createImageData(t.w,t.h); let i=0;
+  for(const row of t.px) for(const p of row){
+    if(p){ const hex=UI_ART.pal[p];
+      id.data[i]=parseInt(hex.slice(1,3),16); id.data[i+1]=parseInt(hex.slice(3,5),16);
+      id.data[i+2]=parseInt(hex.slice(5,7),16); id.data[i+3]=255; }
+    i+=4;
+  }
+  g.putImageData(id,0,0); return c;
+}
+const ROPE_H=buildTile(UI_ART.ropeH), ROPE_V=buildTile(UI_ART.ropeV), ORN=buildTile(UI_ART.corner);
+const RT=7;
+function ropeHBand(x0,x1,y){ cx.save(); cx.beginPath(); cx.rect(x0,y,x1-x0,RT); cx.clip();
+  for(let x=x0;x<x1;x+=8) cx.drawImage(ROPE_H,x,y); cx.restore(); }
+function ropeVBand(y0,y1,x){ cx.save(); cx.beginPath(); cx.rect(x,y0,RT,y1-y0); cx.clip();
+  for(let y=y0;y<y1;y+=8) cx.drawImage(ROPE_V,x,y); cx.restore(); }
+function orn(x,y){ cx.drawImage(ORN,x,y); }
+function rope(x0,y0,x1,y1){
+  ropeHBand(x0,x1,y0); ropeHBand(x0,x1,y1-RT); ropeVBand(y0,y1,x0); ropeVBand(y0,y1,x1-RT);
+  const w=x1-x0, h=y1-y0;
+  orn(x0-1,y0-1); orn(x1-8,y0-1); orn(x0-1,y1-8); orn(x1-8,y1-8);
+  const nx=Math.max(0,Math.round(w/110));
+  for(let i=1;i<=nx;i++){ const x=x0-1+Math.round(i*(w-7)/(nx+1)); orn(x,y0-1); orn(x,y1-8); }
+  const ny=Math.max(0,Math.round(h/110));
+  for(let i=1;i<=ny;i++){ const y=y0-1+Math.round(i*(h-7)/(ny+1)); orn(x0-1,y); orn(x1-8,y); }
+}
+// ---- first-person dungeon: true eye-projection corridor (Gold Box / Wizardry style) ----
+// Eye at z=0 (centre of current cell). Grid boundary planes at z = d+0.5. Walls at x=±0.5,
+// floor/ceiling at y=∓0.5. Perspective: screenX = cx + (x/z)*F, screenY = cy ∓ (0.5/z)*F.
+let VB=null;   // viewport box, set each frame
+function sx(x,z){ return VB.cx + (x/z)*VB.F; }
+function sy(wy,z){ return VB.cy - (wy/z)*VB.F; }   // project any world-height wy at depth z
+function syT(z){ return sy(0.5,z); }                // ceiling (wy=+0.5)
+function syB(z){ return sy(-0.5,z); }               // floor (wy=-0.5)
+// door/arch on a SIDE wall (angled): occupies mid-depth of the wall, floor up ~0.66 high.
+function sideFeature(side,zn,zf,type){
+  if(!DOOR_TYPES[type] && !ARCH_TYPES[type]) return;
+  const x=side*0.5, z0=zn+(zf-zn)*0.30, z1=zn+(zf-zn)*0.70, topY=0.16;
+  const z=(z0+z1)/2, sh=Math.max(0.22,1-(z-1)*0.20);
+  const pts=[[sx(x,z0),sy(topY,z0)],[sx(x,z1),sy(topY,z1)],[sx(x,z1),syB(z1)],[sx(x,z0),syB(z0)]];
+  cx.save(); clipPath(pts); cx.clip();
+  let minx=999,miny=999,maxx=-999,maxy=-999;
+  for(const p of pts){minx=Math.min(minx,p[0]);miny=Math.min(miny,p[1]);maxx=Math.max(maxx,p[0]);maxy=Math.max(maxy,p[1]);}
+  if(DOOR_TYPES[type]){ cx.fillStyle=`rgb(${92*sh|0},${56*sh|0},${26*sh|0})`; } else { cx.fillStyle=`rgba(6,5,4,0.85)`; }
+  cx.fillRect(minx,miny,maxx-minx,maxy-miny);
+  cx.strokeStyle=`rgba(20,14,8,${0.7*sh})`; cx.lineWidth=0.6; clipPath(pts); cx.stroke();
+  cx.restore();
+}
+function clipPath(pts){ cx.beginPath(); cx.moveTo(pts[0][0],pts[0][1]); for(let i=1;i<pts.length;i++) cx.lineTo(pts[i][0],pts[i][1]); cx.closePath(); }
+// fill a perspective face with the REAL decoded stone texture (8X8D tile 17), tile size
+// scaled by distance (nearer = bigger blocks), then distance-darkened. lit = front wall.
+// per-building stone tint from the decoded plane2 backdrop id (gives the city variety)
+function tintFor(tv){ return ({0x84:'rgba(150,120,70,0.20)',0x85:'rgba(120,90,70,0.18)',0x86:'rgba(90,100,130,0.18)',
+  0x87:'rgba(80,95,120,0.20)',0x88:'rgba(40,40,48,0.22)',0x8a:'rgba(150,70,60,0.18)',0x0b:'rgba(70,110,80,0.16)'})[tv]||null; }
+function texFace(pts, z, lit, tint){
+  const sh=Math.max(0.22, 1-(z-1)*0.20);
+  cx.save(); clipPath(pts); cx.clip();
+  let minx=999,miny=999,maxx=-999,maxy=-999;
+  for(const p of pts){minx=Math.min(minx,p[0]);miny=Math.min(miny,p[1]);maxx=Math.max(maxx,p[0]);maxy=Math.max(maxy,p[1]);}
+  if(wallPattern){
+    const ts=Math.max(4, Math.round(VB.F/z*0.20));   // on-screen stone-block size, 1/z
+    for(let y=Math.floor(miny/ts)*ts; y<maxy; y+=ts)
+      for(let x=Math.floor(minx/ts)*ts; x<maxx; x+=ts)
+        cx.drawImage(wallImg, x, y, ts, ts);
+  } else { cx.fillStyle='#8a8a8e'; cx.fillRect(minx,miny,maxx-minx,maxy-miny); }
+  if(tint){ cx.fillStyle=tint; cx.fillRect(minx,miny,maxx-minx,maxy-miny); }   // building material colour
+  // shading: side walls a touch darker than the lit front face
+  cx.fillStyle=`rgba(0,0,0,${(lit?0.0:0.18)+(1-sh)*0.35})`; cx.fillRect(minx,miny,maxx-minx,maxy-miny);
+  // atmospheric fog: distant walls fade toward the dim sky/blue, not pure black
+  cx.fillStyle=`rgba(26,32,48,${(1-sh)*0.5})`; cx.fillRect(minx,miny,maxx-minx,maxy-miny);
+  cx.restore();
+  cx.strokeStyle='rgba(0,0,0,0.55)'; cx.lineWidth=0.6; clipPath(pts); cx.stroke();
+  return {sh};
+}
+// perspective cobblestone floor: rows of the floor tile, getting smaller toward the horizon
+function texFloor(vx,vy,vw,vh){
+  const hy=vy+vh/2;                       // horizon
+  if(!floorPattern){ cx.fillStyle='#2e261c'; cx.fillRect(vx,hy,vw,vh/2); return; }
+  cx.save(); cx.beginPath(); cx.rect(vx,hy,vw,vh/2); cx.clip();
+  // band d covers floor cells at depth z in [d..d+1]; far band = nearer the horizon (smaller y)
+  for(let d=8;d>=1;d--){
+    const yTop=Math.max(hy, syB(d+1)), yBot=Math.min(vy+vh, syB(d));
+    if(yBot<=yTop) continue;
+    const ts=Math.max(4,Math.round(VB.F/(d+0.5)*0.20));
+    for(let y=Math.floor(yTop/ts)*ts; y<yBot; y+=ts)
+      for(let x=vx; x<vx+vw; x+=ts) cx.drawImage(floorImg,x,y,ts,ts);
+    const sh=Math.max(0.42,1-(d-1)*0.10);
+    cx.fillStyle=`rgba(70,52,28,0.18)`; cx.fillRect(vx,yTop,vw,yBot-yTop);   // warm street tint
+    cx.fillStyle=`rgba(10,10,18,${(1-sh)*0.62})`; cx.fillRect(vx,yTop,vw,yBot-yTop); // distance fog
+  }
+  cx.restore();
+}
+function dungeon(vx,vy,vw,vh){
+  VB={cx:vx+vw/2, cy:vy+vh/2, F:vw*0.62};
+  cx.save(); cx.beginPath(); cx.rect(vx,vy,vw,vh); cx.clip();
+  // sky/ceiling (city blocks are open-air: a dim sky gradient) + textured street
+  const cg=cx.createLinearGradient(0,vy,0,vy+vh/2); cg.addColorStop(0,'#0a0e1a'); cg.addColorStop(1,'#1a2030');
+  cx.fillStyle=cg; cx.fillRect(vx,vy,vw,vh/2);
+  texFloor(vx,vy,vw,vh);
+  const fwd=pdir,left=(pdir+3)%4,right=(pdir+1)%4;
+  // PASS 1: find the nearest cell whose FRONT wall blocks the view (occlusion).
+  let dStop=5;
+  for(let d=0;d<=4;d++){ const xx=px+DX[fwd]*d, yy=py+DY[fwd]*d;
+    if(xx<0||yy<0||xx>=W||yy>=H){ dStop=d; break; }
+    if(wallSide(xx,yy,fwd)){ dStop=d; break; } }
+  // PASS 2: paint far -> near so nearer walls overlay farther ones.
+  for(let d=Math.min(dStop,4); d>=0; d--){ const xx=px+DX[fwd]*d, yy=py+DY[fwd]*d; if(xx<0||yy<0||xx>=W||yy>=H)continue;
+    // eye sits at the BACK of the current cell: cell d spans z in [d .. d+1], front wall at z=d+1
+    const zn=Math.max(d,0.1), zf=d+1;
+    const tint=(cell(xx,yy)?tintFor(cell(xx,yy).t):null);
+    if(wallSide(xx,yy,left)){
+      texFace([[sx(-0.5,zn),syT(zn)],[sx(-0.5,zf),syT(zf)],[sx(-0.5,zf),syB(zf)],[sx(-0.5,zn),syB(zn)]],zf,false,tint);
+      sideFeature(-1,zn,zf,wallType(xx,yy,left));
+    }
+    if(wallSide(xx,yy,right)){
+      texFace([[sx(0.5,zn),syT(zn)],[sx(0.5,zf),syT(zf)],[sx(0.5,zf),syB(zf)],[sx(0.5,zn),syB(zn)]],zf,false,tint);
+      sideFeature(1,zn,zf,wallType(xx,yy,right));
+    }
+    if(d===dStop && wallSide(xx,yy,fwd)){
+      const L=sx(-0.5,zf),R=sx(0.5,zf),T=syT(zf),B=syB(zf);
+      texFace([[L,T],[R,T],[R,B],[L,B]],zf,true,tint);
+      wallFeature(wallType(xx,yy,fwd),L,R,T,B,zf);   // faithful: door/arch where the data says
+    }
+  }
+  cx.restore();
+}
+// draw a wall FEATURE for the decoded wall-type value on a front (perpendicular) face.
+// DOOR_TYPES -> arched wooden door; ARCH_TYPES -> open archway; else plain stone.
+function wallFeature(type,L,R,T,B,z){
+  const sh=Math.max(0.25,1-(z-1)*0.20), w=R-L, h=B-T;
+  const cat=faceCat(type), fimg=faceImgFor(type);
+  // plain face = the beveled stone already drawn; only overlay a feature face for door/gate/window/base
+  if(cat!=='plain' && fimg && fimg.complete && fimg.width){
+    cx.save(); cx.beginPath(); cx.rect(L,T,w,h); cx.clip(); cx.imageSmoothingEnabled=false;
+    cx.drawImage(fimg,L,T,w,h);
+    cx.fillStyle=`rgba(0,0,0,${(1-sh)*0.4})`; cx.fillRect(L,T,w,h); cx.restore(); return;
+  }
+  if(cat==='plain') return;
+  // fallback: procedural door/arch (if a face image hasn't loaded)
+  const wood=`rgb(${110*sh|0},${70*sh|0},${34*sh|0})`, dark=a=>`rgba(6,5,4,${a})`;
+  cx.save(); cx.beginPath(); cx.rect(L,T,w,h); cx.clip();
+  if(DOOR_TYPES[type]){
+    const dw=w*0.36, dh=h*0.66, dx=L+(w-dw)/2, dy=B-dh;
+    cx.fillStyle=wood; cx.fillRect(dx-1.2,dy-1.2,dw+2.4,dh+2.4);          // wood frame
+    cx.fillStyle=`rgb(${86*sh|0},${52*sh|0},${24*sh|0})`;                 // door planks
+    cx.beginPath(); cx.moveTo(dx,dy+dw*0.5); cx.quadraticCurveTo(dx,dy,dx+dw/2,dy); cx.quadraticCurveTo(dx+dw,dy,dx+dw,dy+dw*0.5); cx.lineTo(dx+dw,B); cx.lineTo(dx,B); cx.closePath(); cx.fill();
+    cx.strokeStyle=dark(0.6*sh); cx.lineWidth=0.5;
+    for(let k=1;k<3;k++){ cx.beginPath(); cx.moveTo(dx+dw*k/3,dy); cx.lineTo(dx+dw*k/3,B); cx.stroke(); }
+    cx.fillStyle=`rgb(${200*sh|0},${170*sh|0},${60*sh|0})`; cx.fillRect(dx+dw*0.74,dy+dh*0.52,Math.max(1,w*0.012),Math.max(1,w*0.012)); // handle
+  } else if(ARCH_TYPES[type]){
+    const aw=w*0.5, ah=h*0.74, ax=L+(w-aw)/2, ay=B-ah;
+    cx.fillStyle=dark(0.85);
+    cx.beginPath(); cx.moveTo(ax,B); cx.lineTo(ax,ay+aw*0.5); cx.quadraticCurveTo(ax,ay,ax+aw/2,ay); cx.quadraticCurveTo(ax+aw,ay,ax+aw,ay+aw*0.5); cx.lineTo(ax+aw,B); cx.closePath(); cx.fill();
+  }
+  cx.restore();
+}
+const CLS={Fighter:"FTR","Fighter/Magic-User":"F/M",Cleric:"CLR","Magic-User":"M-U",Thief:"THF"};
+function wrap(s,n){ const out=[]; let line='';
+  for(const w of s.split(/\s+/)){ if((line?line.length+1:0)+w.length<=n) line=line?line+' '+w:w; else {out.push(line); line=w;} }
+  if(line) out.push(line); return out; }
+
+// ---- TITLE ----
+function drawTitle(){
+  cx.fillStyle='#000'; cx.fillRect(0,0,320,200);
+  if(imgsReady){ const tw=titleImg.width, th=titleImg.height;
+    // draw native size, centred, clipped to the screen; crop the 1px header bleed
+    const dx=Math.round((320-tw)/2);
+    cx.drawImage(titleImg, 0,1, tw, th-1, dx, 0, tw, th-1);
+  }
+  ctext(160,186,"PRESS ANY KEY",EGA[14]);
+}
+// ---- PARTY SELECT ----
+function drawParty(){
+  cx.fillStyle='#000'; cx.fillRect(0,0,320,200);
+  rope(0,0,320,200);
+  ctext(160,12,"POOL OF RADIANCE",EGA[14]);
+  ctext(160,24,"YOUR ADVENTURING PARTY",EGA[11]);
+  // 3 columns x 2 rows of decoded portraits with name + class
+  const PW=58, PH=26, cols=3, gx=14, gy=40, padx=(320-2*gx-cols*PW)/(cols-1), pady=18;
+  D.party.forEach((c,i)=>{
+    const col=i%cols, row=(i/cols)|0;
+    const bx=gx+col*(PW+padx), by=gy+row*(PH+pady+18);
+    const im=headImgs[i%headImgs.length];
+    // frame
+    cx.fillStyle=EGA[8]; cx.fillRect(bx-1,by-1,PW+2,PH+2);
+    if(im&&im.complete) cx.drawImage(im,bx,by,PW,PH);
+    const nm=c.name.split(' ')[0].slice(0,9);
+    ctext(bx+PW/2,by+PH+3,nm,EGA[15]);
+    ctext(bx+PW/2,by+PH+12,(CLS[c.cls]||'FTR')+"  HP"+c.hp,EGA[10]);
+  });
+  ctext(160,182,"PRESS ENTER TO BEGIN ADVENTURE",EGA[13]);
+}
+// ---- command bar: each option, first letter gold, rest cyan (Gold Box style) ----
+function cmdbar(opts){
+  const total=opts.reduce((s,o)=>s+o.length,0);
+  const gap=Math.max(3,(316-total*8)/(opts.length)); let x=6;
+  for(const o of opts){
+    text(x,192,o[0],EGA[14]); text(x+8,192,o.slice(1),EGA[11]);
+    x+=o.length*8+gap;
+  }
+}
+const AC_GUESS=[4,4,6,5,9,7];
+function ac(i){ return D.party[i].acGuess||AC_GUESS[i]; }
+// ---- MAIN CITY VIEW ----
+function drawGame(){
+  cx.fillStyle='#000'; cx.fillRect(0,0,320,200);
+  rope(0,0,320,190);
+  const vx=8,vy=8,vw=140,vh=140; rope(vx,vy,vx+vw,vy+vh);
+  const ix=vx+RT+1,iy=vy+RT+1,iw=vw-2*RT-2,ih=vh-2*RT-2;
+  cx.save(); cx.beginPath(); cx.rect(ix,iy,iw,ih); cx.clip();
+  if(inCombat) drawCombat(ix,iy,iw,ih); else dungeon(ix,iy,iw,ih); cx.restore();
+  // roster (right) — small correct-aspect portrait thumbs; active char highlighted
+  text(156,11,"NAME",EGA[15]); text(268,11,"AC",EGA[15]); text(294,11,"HP",EGA[15]);
+  let y=22;
+  D.party.forEach((c,i)=>{
+    if(i===active){ cx.fillStyle='rgba(255,210,70,0.18)'; cx.fillRect(152,y-1,164,11); }
+    const im=headImgs[i%headImgs.length];
+    if(im&&im.complete) cx.drawImage(im,154,y,20,9);     // 88:40 ~= 20:9, no distortion
+    const col=i===active?EGA[14]:EGA[11];
+    text(178,y+1,c.name.split(' ')[0].slice(0,7)+' '+(CLS[c.cls]||'FTR'),col);
+    text(268,y+1,String(ac(i)),col); text(294,y+1,String(c.hp),col); y+=12;
+  });
+  text(156,138,(LEVELS[lvl].name.toUpperCase()+" "+px+","+py+(searchMode?" *SRCH":"")).slice(0,19),EGA[10]);
+  ropeHBand(0,320,150); orn(-1,149); orn(312,149); orn(156,149);
+  const lines=wrap((msg||"").toUpperCase(),37);
+  lines.slice(0,2).forEach((l,i)=>text(10,160+i*10,l,EGA[10]));
+  cmdbar(["MOVE","VIEW","CAST","AREA","ENCAMP","SEARCH","LOOK"]);
+}
+// ---- VIEW: character screen ----
+function drawCharScreen(){
+  cx.fillStyle='#000'; cx.fillRect(0,0,320,200); rope(0,0,320,200);
+  const c=D.party[active];
+  const im=headImgs[active%headImgs.length];
+  if(im&&im.complete){ cx.fillStyle=EGA[8]; cx.fillRect(13,13,90,42); cx.drawImage(im,14,14,88,40); }
+  text(112,14,c.name.toUpperCase().slice(0,22),EGA[14]);
+  text(112,26,(c.cls||'Fighter').toUpperCase(),EGA[11]);
+  text(112,36,"AC "+ac(active)+"   HP "+c.hp+"   THAC0 "+(20-(c.cls&&c.cls.includes('Fighter')?1:0)),EGA[10]);
+  text(112,46,"STATUS: OK",EGA[10]);
+  // ability scores
+  const S=c.stats||{}; const ab=["STR","INT","WIS","DEX","CON","CHA"];
+  let y=66; text(16,y-12,"ABILITIES",EGA[15]);
+  ab.forEach((a,i)=>{ const xx=16+(i%2)*150; const yy=y+((i/2)|0)*12;
+    text(xx,yy,a+":",EGA[11]); text(xx+40,yy,String(S[a]!=null?S[a]:'-')+(a==='STR'&&c.exstr?'/'+c.exstr:''),EGA[14]); });
+  // tab content
+  if(viewTab==='items'){
+    text(16,108,"ITEMS CARRIED:",EGA[15]); let yy=120;
+    (c.items&&c.items.length?c.items:['(nothing)']).forEach(it=>{ text(20,yy,"* "+it.toUpperCase(),EGA[11]); yy+=10; });
+  } else if(viewTab==='spells'){
+    text(16,108,"SPELLS:",EGA[15]);
+    const caster=(c.cls||'').match(/Magic|Cleric/);
+    if(caster){ const sp=(c.cls.includes('Cleric'))?['BLESS','CURE LIGHT WOUNDS','PROTECTION FROM EVIL']:['MAGIC MISSILE','SHIELD','SLEEP','DETECT MAGIC'];
+      let yy=120; sp.forEach(s=>{ text(20,yy,"* "+s,EGA[11]); yy+=10; }); }
+    else text(20,120,"THIS CHARACTER CANNOT CAST SPELLS.",EGA[8]);
+  } else {
+    text(16,108,"THIEF SKILLS:",EGA[15]);
+    if(c.thief){ let yy=120; Object.entries(c.thief).slice(0,5).forEach(([k,v])=>{ text(20,yy,(k+":").toUpperCase().slice(0,16)+" "+v+"%",EGA[11]); yy+=10; }); }
+    else text(20,120,"(NONE)",EGA[8]);
+  }
+  ropeHBand(0,320,182); orn(-1,181); orn(312,181);
+  cmdbar(["ITEMS","SPELLS","THIEF","NEXT","EXIT"]);
+}
+// ---- AREA: overhead strategic map (plane2 colored: buildings vs open) ----
+function drawArea(){
+  cx.fillStyle='#000'; cx.fillRect(0,0,320,200); rope(0,0,320,200);
+  ctext(160,12,"AREA MAP — "+LEVELS[lvl].name.toUpperCase(),EGA[14]);
+  const ox=44,oy=26,cs=9, w=curWalls;
+  for(let y=0;y<16;y++)for(let x=0;x<16;x++){
+    const c=w[y][x]; const gx=ox+x*cs, gy=oy+y*cs;
+    // backdrop by plane2 texture id: 0=open street, 0x8x=building, 0x0B=alt ground
+    let fill='#101820';
+    if(c.t===0) fill='#243018'; else if((c.t&0x80)) fill='#3a2a16'; else if(c.t===0x0B) fill='#202830';
+    cx.fillStyle=fill; cx.fillRect(gx,gy,cs,cs);
+    // walls — doors (decoded door-types) drawn as a gap with a gold pip, like the real AREA map
+    const seg=(x0,y0,x1,y1,v)=>{ const door=DOOR_TYPES[v];
+      cx.strokeStyle=door?'#c89028':EGA[15]; cx.lineWidth=door?1.2:0.7;
+      if(door){ const mx=(x0+x1)/2,my=(y0+y1)/2;
+        cx.beginPath();cx.moveTo(x0,y0);cx.lineTo((x0+mx)/2,(y0+my)/2);cx.moveTo((mx+x1)/2,(my+y1)/2);cx.lineTo(x1,y1);cx.stroke();
+        cx.fillStyle='#fc4'; cx.fillRect(mx-0.8,my-0.8,1.6,1.6);
+      } else { cx.beginPath();cx.moveTo(x0,y0);cx.lineTo(x1,y1);cx.stroke(); } };
+    if(c.n)seg(gx,gy,gx+cs,gy,c.n);
+    if(c.w)seg(gx,gy,gx,gy+cs,c.w);
+    if(c.s)seg(gx,gy+cs,gx+cs,gy+cs,c.s);
+    if(c.e)seg(gx+cs,gy,gx+cs,gy+cs,c.e);
+  }
+  // party marker + facing
+  const mx=ox+px*cs+cs/2, my=oy+py*cs+cs/2;
+  cx.fillStyle=EGA[14]; cx.beginPath();
+  const ang=[-Math.PI/2,0,Math.PI/2,Math.PI][pdir];
+  for(let k=0;k<3;k++){ const a=ang+k*2.094; cx.lineTo(mx+Math.cos(a)*5,my+Math.sin(a)*5); }
+  cx.closePath(); cx.fill();
+  text(30,178,"OPEN",EGA[10]); cx.fillStyle='#243018';cx.fillRect(64,172,7,7);
+  text(80,178,"BLDG",EGA[10]); cx.fillStyle='#3a2a16';cx.fillRect(112,172,7,7);
+  text(128,178,"DOOR",EGA[10]); cx.fillStyle='#fc4';cx.fillRect(160,173,5,5);
+  ctext(244,178,"X=EXIT",EGA[13]);
+}
+// ---- ENCAMP menu ----
+function drawEncamp(){
+  cx.fillStyle='#000'; cx.fillRect(0,0,320,200); rope(0,0,320,200);
+  ctext(160,16,"ENCAMP",EGA[14]);
+  ctext(160,30,"THE PARTY MAKES CAMP...",EGA[11]);
+  const opts=["SAVE","VIEW","MAGIC","REST","ALTER","EXIT"]; let y=54;
+  opts.forEach((o,i)=>{ ctext(160,y,"("+o[0]+")"+o.slice(1),i===0?EGA[14]:EGA[11]); y+=16; });
+  const lines=wrap((msg||"").toUpperCase(),37);
+  lines.slice(0,2).forEach((l,i)=>text(10,162+i*10,l,EGA[10]));
+  cmdbar(["SAVE","VIEW","MAGIC","REST","ALTER","EXIT"]);
+}
+// ---- simple centered-list menu screen ----
+function listMenu(title, sub, opts, hint){
+  cx.fillStyle='#000'; cx.fillRect(0,0,320,200); rope(0,0,320,200);
+  ctext(160,16,title,EGA[14]); if(sub) ctext(160,30,sub,EGA[11]);
+  let y=52; opts.forEach(o=>{ ctext(160,y,o,EGA[11]); y+=14; });
+  const lines=wrap((msg||"").toUpperCase(),37); lines.slice(0,2).forEach((l,i)=>text(10,150+i*10,l,EGA[10]));
+  cmdbar(opts.map(o=>o.replace(/[()]/g,'')).concat(hint?[]:[]));
+}
+function drawCast(){
+  const c=D.party[active]; const caster=(c.cls||'').match(/Magic|Cleric/);
+  cx.fillStyle='#000'; cx.fillRect(0,0,320,200); rope(0,0,320,200);
+  ctext(160,16,"CAST — "+c.name.split(' ')[0].toUpperCase(),EGA[14]);
+  if(!caster){ ctext(160,90,"THIS CHARACTER CANNOT CAST SPELLS.",EGA[8]); ctext(160,182,"E)XIT",EGA[13]); return; }
+  const sp=c.cls.includes('Cleric')?[['BLESS','+1 to hit, party'],['CURE LIGHT WOUNDS','heal 1d8'],['PROTECTION FROM EVIL','-2 AC vs evil']]
+    :[['MAGIC MISSILE','1d4+1 auto-hit'],['SHIELD','AC 2 vs missiles'],['SLEEP','2d4 HD sleep'],['DETECT MAGIC','reveal enchantment']];
+  text(24,40,"MEMORIZED SPELLS:",EGA[15]); let y=56;
+  sp.forEach((s,i)=>{ text(28,y,(i+1)+") "+s[0],EGA[14]); text(40,y+9,s[1],EGA[10]); y+=22; });
+  ctext(160,182,"PRESS 1-"+sp.length+" TO CAST,  E)XIT",EGA[13]);
+}
+function drawSub(title,opts){
+  cx.fillStyle='#000'; cx.fillRect(0,0,320,200); rope(0,0,320,200);
+  ctext(160,16,title,EGA[14]);
+  let y=46; opts.forEach(o=>{ ctext(160,y,o[0]+" — "+o[1],o[2]?EGA[14]:EGA[11]); y+=16; });
+  const lines=wrap((msg||"").toUpperCase(),37); lines.slice(0,2).forEach((l,i)=>text(10,160+i*10,l,EGA[10]));
+  cmdbar(opts.map(o=>o[0]).concat(["EXIT"]));
+}
+function drawItems(){
+  const c=D.party[active];
+  cx.fillStyle='#000'; cx.fillRect(0,0,320,200); rope(0,0,320,200);
+  ctext(160,16,"ITEMS — "+c.name.split(' ')[0].toUpperCase(),EGA[14]);
+  text(20,36,"ITEM",EGA[15]); text(220,36,"READY",EGA[15]);
+  let y=50; (c.items&&c.items.length?c.items:['(nothing carried)']).forEach((it,i)=>{
+    text(20,y,it.toUpperCase().slice(0,24),i===itemSel?EGA[14]:EGA[11]);
+    if(c.items&&c.items.length) text(228,y,"YES",EGA[10]); y+=12; });
+  const lines=wrap((msg||"").toUpperCase(),37); lines.slice(0,2).forEach((l,i)=>text(10,160+i*10,l,EGA[10]));
+  cmdbar(["READY","USE","TRADE","DROP","HALVE","JOIN","SELL","ID","EXIT"]);
+}
+function draw(){
+  if(phase==='title') return drawTitle();
+  if(phase==='party') return drawParty();
+  const t=curMenu();
+  if(t==='view') return drawCharScreen();
+  if(t==='area') return drawArea();
+  if(t==='encamp') return drawEncamp();
+  if(t==='cast') return drawCast();
+  if(t==='items') return drawItems();
+  if(t==='magic') return drawSub("ENCAMP — MAGIC",[["R","Rest & memorize spells"],["D","Display memorized"],["C","Clear memorized"]]);
+  if(t==='alter') return drawSub("ENCAMP — ALTER",[["O","Order (reorder party)"],["I","combat Icons"],["D","Drop character"]]);
+  drawGame();
+}
+function look(){ const a=areaLines(); msg=a.length? a[0] : "You stand in the streets of Phlan."; }
+look();
+function tryMove(sign){ const side=sign>0?pdir:(pdir+2)%4; const t=wallType(px,py,side);
+  if(t>0){ if(DOOR_TYPES[t]||ARCH_TYPES[t]){ msg=DOOR_TYPES[t]?"You open the door and pass through.":"You pass through the archway."; }
+           else { msg="A wall blocks your way."; draw(); return; } }
+  const nx=px+DX[pdir]*sign, ny=py+DY[pdir]*sign; if(!cell(nx,ny)){msg="The passage ends.";draw();return;}
+  px=nx;py=ny; if(!(t>0)) look(); draw(); }
+function changeLevel(d){ lvl=(lvl+d+LEVELS.length)%LEVELS.length; curWalls=LEVELS[lvl].walls; findStart(); look(); draw(); }
+// ---- combat ----
+const combatSpr=(D.combat||[]).map(s=>{const i=new Image();i.src=s.url;return i;});
+const monSpr=(D.monsters||[]).map(s=>{const i=new Image();i.src=s.url;return i;});
+let inCombat=false, cu=[], clog="";
+function startFight(){ inCombat=true; cu=[];
+  D.party.forEach((c,i)=>cu.push({side:'pc',x:1,y:1+i,hp:Math.max(c.hp,1),mhp:Math.max(c.hp,1),img:combatSpr[i%combatSpr.length]}));
+  const nm=3+Math.floor(Math.random()*3);
+  for(let i=0;i<nm;i++) cu.push({side:'mon',x:6,y:1+i,hp:6+Math.floor(Math.random()*6),mhp:11,img:monSpr[(i*2)%monSpr.length]});
+  clog="A wandering encounter blocks the way!"; msg=clog; draw();
+}
+function combatStep(){
+  if(!inCombat) return;
+  const pcs=cu.filter(u=>u.side==='pc'&&u.hp>0), mons=cu.filter(u=>u.side==='mon'&&u.hp>0);
+  if(!mons.length){ inCombat=false; msg="Victory! The foes are slain."; draw(); return; }
+  if(!pcs.length){ inCombat=false; msg="The party has fallen..."; draw(); return; }
+  const a=pcs[Math.floor(Math.random()*pcs.length)], t=mons[Math.floor(Math.random()*mons.length)];
+  const dmg=1+Math.floor(Math.random()*8); t.hp-=dmg; clog=`A hit for ${dmg}!`; msg=clog;
+  if(mons.length){ const m=mons[0], p=pcs[Math.floor(Math.random()*pcs.length)]; if(Math.random()<0.5) p.hp-=1+Math.floor(Math.random()*4); }
+  draw();
+}
+function drawCombat(vx,vy,vw,vh){
+  // clean dark battlefield floor (plain, so sprites read) with a faint grid — no busy texture
+  const g=cx.createLinearGradient(0,vy,0,vy+vh);
+  g.addColorStop(0,'#181410'); g.addColorStop(1,'#2a241c');
+  cx.fillStyle=g; cx.fillRect(vx,vy,vw,vh);
+  const GW=7,GH=6, cw=vw/GW, ch=vh/GH;
+  cx.strokeStyle='rgba(180,150,90,0.12)'; cx.lineWidth=0.3;
+  for(let x=0;x<=GW;x++){cx.beginPath();cx.moveTo(vx+x*cw,vy);cx.lineTo(vx+x*cw,vy+vh);cx.stroke();}
+  for(let y=0;y<=GH;y++){cx.beginPath();cx.moveTo(vx,vy+y*ch);cx.lineTo(vx+vw,vy+y*ch);cx.stroke();}
+  // draw sprites at their native aspect, as large as the cell allows
+  cu.forEach(u=>{ if(u.hp<=0)return; const im=u.img;
+    const sw=Math.min(cw*1.4, ch*0.85*(im&&im.width?im.width/im.height:0.55));
+    const sh=sw*(im&&im.width?im.height/im.width:1.8);
+    const ix=vx+u.x*cw+(cw-sw)/2, iy=vy+u.y*ch+ch-sh;
+    if(im&&im.complete){ cx.save(); if(u.side==='mon'){cx.translate(ix+sw,iy);cx.scale(-1,1);cx.drawImage(im,0,0,sw,sh);} else cx.drawImage(im,ix,iy,sw,sh); cx.restore(); }
+    cx.fillStyle=u.side==='pc'?EGA[10]:EGA[12]; cx.fillRect(vx+u.x*cw+1,vy+u.y*ch+ch-2,(cw-2)*Math.max(0,u.hp/u.mhp),1.5);
+  });
+}
+document.addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if(phase==='title'){ phase='party'; draw(); e.preventDefault(); return; }
+  if(phase==='party'){ if(e.key==='Enter'||e.key===' '){ phase='game'; nav=['move']; draw(); } e.preventDefault(); return; }
+  e.preventDefault();
+  const t=curMenu();
+  // E / Escape = EXIT one level on every submenu (the menus are circular/hierarchical)
+  if(t!=='move' && (k==='e' || e.key==='Escape')){ back(); return; }
+  // ---- VIEW (character screen) ----
+  if(t==='view'){
+    if(k==='i'){ itemSel=0; push('items'); return; }
+    else if(k==='s')viewTab='spells'; else if(k==='t')viewTab='thief';
+    else if(k==='n'||e.key==='ArrowDown'||e.key==='ArrowRight')active=(active+1)%D.party.length;
+    else if(e.key==='ArrowUp'||e.key==='ArrowLeft')active=(active+D.party.length-1)%D.party.length;
+    draw(); return;
+  }
+  // ---- ITEMS (item menu) ----
+  if(t==='items'){
+    const c=D.party[active], n=(c.items||[]).length;
+    if((e.key==='ArrowDown')&&n)itemSel=(itemSel+1)%n;
+    else if((e.key==='ArrowUp')&&n)itemSel=(itemSel+n-1)%n;
+    else if(k==='r')msg=(c.items&&c.items[itemSel]?c.items[itemSel].toUpperCase()+" is readied.":"Nothing to ready.");
+    else if(k==='u')msg="You use the item.";
+    else if(k==='d')msg="You drop the item.";
+    else if(k==='i')msg="The item radiates no detectable magic.";
+    else if(k==='s')msg="No merchant here to sell to.";
+    draw(); return;
+  }
+  // ---- AREA (overhead map): any key exits ----
+  if(t==='area'){ back(); return; }
+  // ---- CAST ----
+  if(t==='cast'){
+    const c=D.party[active], caster=(c.cls||'').match(/Magic|Cleric/);
+    if(caster && k>='1'&&k<='9'){ msg=c.name.split(' ')[0]+" casts a spell!  (a shimmer of magic fills the air)"; back(); }
+    else draw();
+    return;
+  }
+  // ---- ENCAMP ----
+  if(t==='encamp'){
+    if(k==='r'){ D.party.forEach(c=>c.hp=c.hp+3); msg="The party rests. Wounds bound, spells regained."; }
+    else if(k==='s'){ msg="Game saved. (demo)"; }
+    else if(k==='v'){ push('view'); return; }
+    else if(k==='m'){ push('magic'); return; }
+    else if(k==='a'){ push('alter'); return; }
+    draw(); return;
+  }
+  if(t==='magic'){
+    if(k==='r')msg="Spellcasters rest and memorize their spells.";
+    else if(k==='d')msg="Memorized: Magic Missile, Shield, Sleep...";
+    else if(k==='c')msg="Memorized spells cleared.";
+    draw(); return;
+  }
+  if(t==='alter'){
+    if(k==='o')msg="Party reordered. (demo)";
+    else if(k==='i')msg="Combat icon editor. (demo)";
+    else if(k==='d')msg="Drop a character. (demo)";
+    draw(); return;
+  }
+  // ---- combat ----
+  if(inCombat){ if(k==='f'||e.key==='Enter')combatStep(); else if(e.key==='Escape'){inCombat=false;look();draw();} return; }
+  // ---- MOVE (root adventure menu) ----
+  if(e.key==='ArrowUp')tryMove(1); else if(e.key==='ArrowDown')tryMove(-1);
+  else if(e.key==='ArrowLeft'){pdir=(pdir+3)%4;draw();} else if(e.key==='ArrowRight'){pdir=(pdir+1)%4;draw();}
+  else if(e.key==='>'||e.key==='.')changeLevel(1); else if(e.key==='<'||e.key===',')changeLevel(-1);
+  else if(k>='1'&&k<='6'){ active=Math.min(+k-1,D.party.length-1); draw(); }
+  else if(k==='m'){ msg="Move: arrow keys walk and turn."; draw(); }
+  else if(k==='v'){ itemSel=0; push('view'); }
+  else if(k==='c'){ push('cast'); }
+  else if(k==='a'){ push('area'); }
+  else if(k==='e'){ msg="The party makes camp."; push('encamp'); }
+  else if(k==='s'){ searchMode=!searchMode;
+    if(searchMode){ const ft=wallType(px,py,pdir); const sd=[0,1,2,3].find(d=>{const v=wallType(px,py,d);return DOOR_TYPES[v]&&v>=13;});
+      msg=sd!=null?"Searching... you find a concealed door to the "+["NORTH","EAST","SOUTH","WEST"][sd]+"!":"Search mode ON — moving carefully, watching for secret doors and traps."; }
+    else msg="Search mode off."; draw(); }
+  else if(k==='l'){ const ft=wallType(px,py,pdir), dir=["north","east","south","west"][pdir];
+    msg = ft===0 ? "The way "+dir+" is open." : DOOR_TYPES[ft] ? "A door stands to the "+dir+"." : ARCH_TYPES[ft] ? "An archway opens to the "+dir+"." : "A stone wall faces "+dir+". "+(areaLines()[0]||""); draw(); }
+  else if(k==='f'){ startFight(); }
+});
+draw();
+// capture/test hooks
+if(location.search.indexOf('party=1')>=0){ phase='party'; draw(); }
+{ const m=location.search.match(/pos=(\d+),(\d+),(\d+)/); if(m){ px=+m[1];py=+m[2];pdir=+m[3]; phase='game'; look(); draw(); } }
+if(location.search.indexOf('notitle')>=0){ phase='game'; draw(); }
+{ const m=location.search.match(/ui=(\w+)/); if(m){ phase='game'; nav=['move',m[1]]; look(); draw(); } }
+if(location.search.indexOf('fight=1')>=0){ phase='game'; startFight(); combatStep(); combatStep(); }
+async function autoplay(){
+  const wait=ms=>new Promise(r=>setTimeout(r,ms));
+  await wait(2000); phase='party'; draw(); await wait(2600);
+  phase='game'; draw(); await wait(700);
+  for(let i=0;i<2;i++){ tryMove(1); await wait(700); }
+  await wait(2400); startFight(); await wait(900);
+  for(let i=0;i<14;i++){ if(!inCombat)break; combatStep(); await wait(650); }
+  await wait(1500); changeLevel(2); await wait(3000);
+  for(let i=0;i<2;i++){ tryMove(1); await wait(700); }
+  await wait(1200); window.__autoplayDone=true;
+}
+if(location.search.indexOf('autoplay=1')>=0) autoplay();
+</script></body></html>

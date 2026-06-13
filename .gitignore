@@ -1,0 +1,20 @@
+# copyrighted original game files — never commit
+*.exe
+*.EXE
+*.dax
+*.DAX
+*.sav
+*.SAV
+*.itm
+*.ITM
+extracted/
+# regenerated locally from YOUR OWN game copy (contains decoded data)
+**/reproduction/game_data.js
+**/reproduction/ui_art.js
+# images / decoded art / binaries
+*.png
+*.jpg
+*.jpeg
+*.bin
+__pycache__/
+*.pyc
