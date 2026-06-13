@@ -22,9 +22,9 @@ Per-game findings and the decode write-ups are in `games/<game>/docs/`, and the 
 are in `games/<game>/analysis/` and `kit/`.
 
 ## ⭐ A note on the models — and a challenge to you
-This was driven through Claude Code with **model-aware routing**:
+This was driven through Claude Code, switching models by hand when I got stuck:
 - **Claude Opus 4.8** carried most of the load — planning, the decode grind, reconstruction.
-- **Claude Fable 5** broke through on the hardest cracks when Opus hit a wall.
+- **Claude Fable 5** broke through on the hardest cracks when Opus hit a wall (I escalated to it manually, then switched back).
 
 **Fable 5 was decommissioned on 2026-06-12** (US export-control directive), so the "escalate to Fable at
 the wall" step isn't reproducible today. **Opus 4.8 and the open tier remain available.** The open
